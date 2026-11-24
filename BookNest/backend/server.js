@@ -1,9 +1,8 @@
-
 import express from "express";
 import cors from "cors";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
-import fs from "node:fs";
+import { createClient } from "@supabase/supabase-js";
 import { randomUUID } from "node:crypto";
 
 // ==============================
@@ -14,7 +13,8 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-const secret = process.env.JWT_SECRET || randomUUID();
+const secret = process.env.JWT_SECRET;
+if (!secret || secret.length < 32) throw new Error("Configure a strong JWT_SECRET (32+ characters)");
 
 const origin =
   process.env.FRONTEND_URL || "http://localhost:5173";
@@ -41,11 +41,12 @@ const titles = [
 // JSON DATABASE
 // ==============================
 
-const file = new URL("./data.json", import.meta.url);
-
-let db = fs.existsSync(file)
-  ? JSON.parse(fs.readFileSync(file, "utf8"))
-  : {
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { persistSession: false, autoRefreshToken: false } }
+);
+const initialData = {
       products: titles.map(
         ([name, author, category, price], i) => ({
           id: i + 1,
@@ -62,10 +63,32 @@ let db = fs.existsSync(file)
       orders: [],
       carts: {},
     };
-
-const save = () => {
-  fs.writeFileSync(file, JSON.stringify(db, null, 2));
-};
+let db;
+let writes = Promise.resolve();
+async function save() {
+  const snapshot = structuredClone(db);
+  const job = writes.then(async () => {
+    const { error } = await supabase.from("booknest_data")
+      .update({ data: snapshot, updated_at: new Date().toISOString() })
+      .eq("id", 1).select("id").single();
+    if (error) {
+      console.error("Database save failed:", error.message);
+      process.exit(1); // restart and reload durable state rather than serve unsaved changes
+    }
+  });
+  writes = job.catch(() => {});
+  return job;
+}
+async function initializeDatabase() {
+  const { error: seedError } = await supabase.from("booknest_data")
+    .upsert({ id: 1, data: initialData }, { onConflict: "id", ignoreDuplicates: true });
+  if (seedError) throw seedError;
+  const { data, error } = await supabase.from("booknest_data")
+    .select("data").eq("id", 1).single();
+  if (error) throw error;
+  db = data.data;
+  console.log("Supabase database connected");
+}
 
 // ==============================
 // API RESPONSE HELPERS
@@ -90,8 +113,26 @@ const fail = (r, status, code, message) => {
 };
 
 const api = express.Router();
+for (const method of ["get", "post", "put"]) {
+  const register = api[method].bind(api);
+  api[method] = (path, ...handlers) => register(path, ...handlers.map(handler =>
+    (q, r, next) => Promise.resolve().then(() => handler(q, r, next)).catch(next)
+  ));
+}
 
-app.use("/api/v1", api);
+// Single-instance demo: serialize API requests to protect the shared JSON record.
+let requestQueue = Promise.resolve();
+app.use("/api/v1", (q, r, next) => {
+  const previous = requestQueue;
+  let release;
+  requestQueue = new Promise(resolve => { release = resolve; });
+  previous.then(() => {
+    r.once("finish", release);
+    r.once("close", release);
+    if (r.destroyed) return release();
+    next();
+  });
+}, api);
 
 // ==============================
 // ROOT AND HEALTH CHECK
@@ -110,6 +151,7 @@ app.get("/health", (q, r) => {
   r.json({
     status: "healthy",
     groqConfigured: Boolean(process.env.GROQ_API_KEY),
+    database: "Supabase",
   });
 });
 
@@ -180,7 +222,7 @@ api.post("/auth/register", async (q, r) => {
     password: hashedPassword,
   });
 
-  save();
+  await save();
 
   return ok(r, {
     registered: true,
@@ -280,7 +322,7 @@ api.get("/cart", auth, (q, r) => {
   return ok(r, cart(q.user.id));
 });
 
-api.put("/cart", auth, (q, r) => {
+api.put("/cart", auth, async (q, r) => {
   const items = q.body.items;
 
   if (
@@ -306,7 +348,7 @@ api.put("/cart", auth, (q, r) => {
 
   db.carts[q.user.id] = items;
 
-  save();
+  await save();
 
   return ok(r, cart(q.user.id));
 });
@@ -575,7 +617,7 @@ api.post("/checkout", auth, async (q, r) => {
 
   db.orders.push(o);
 
-  save();
+  await save();
 
   try {
     const res = await fetch(
@@ -624,7 +666,7 @@ api.post("/checkout", auth, async (q, r) => {
     o.checkoutUrl = d.redirectUrl;
     o.checkoutId = d.checkoutId;
 
-    save();
+    await save();
 
     console.log("Maya sandbox checkout created");
 
@@ -637,7 +679,7 @@ api.post("/checkout", auth, async (q, r) => {
       (x) => x !== o
     );
 
-    save();
+    await save();
 
     return fail(
       r,
@@ -722,7 +764,7 @@ api.post("/orders/:id/verify", auth, async (q, r) => {
           }
         }
 
-        save();
+        await save();
 
         console.log("Sandbox payment verified:", o.id);
       }
@@ -749,6 +791,13 @@ api.post("/orders/:id/verify", auth, async (q, r) => {
 // START SERVER
 // ==============================
 
+app.use((error, q, r, next) => {
+  console.error("API error:", error.message);
+  if (r.headersSent) return next(error);
+  fail(r, 503, "SERVER_ERROR", "Request could not be completed.");
+});
+
+await initializeDatabase();
 app.listen(PORT, "0.0.0.0", () => {
   console.log("==================================");
   console.log("BookNest Backend is running");
