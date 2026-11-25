@@ -159,115 +159,19 @@ app.get("/health", (q, r) => {
 // AUTHENTICATION MIDDLEWARE
 // ==============================
 
-function auth(q, r, n) {
-  try {
-    const token = q.headers.authorization?.split(" ")[1];
-
-    q.user = jwt.verify(token, secret);
-
-    if (!db.users.some((u) => u.id === q.user.id)) {
-      return fail(r, 401, "UNAUTHORIZED", "Please sign in again.");
-    }
-
-    n();
-  } catch {
-    return fail(
-      r,
-      401,
-      "UNAUTHORIZED",
-      "Please sign in."
-    );
-  }
+async function auth(q,r,n){
+ let claims; try { claims=jwt.verify(q.headers.authorization?.split(" ")[1],secret); } catch {return fail(r,401,"UNAUTHORIZED","Please sign in.");}
+ const {data,error}=await supabase.from("users").select("id,email,role").eq("id",claims.id).maybeSingle();
+ if(error)return fail(r,503,"DATABASE_ERROR","Database unavailable");
+ if(!data)return fail(r,401,"UNAUTHORIZED","Please sign in again"); q.user=data; n();
 }
-
-// ==============================
-// REGISTER
-// ==============================
-
-api.post("/auth/register", async (q, r) => {
-  const { email, password } = q.body;
-
-  if (
-    typeof email !== "string" ||
-    !email.trim() ||
-    typeof password !== "string" ||
-    password.length < 8
-  ) {
-    return fail(
-      r,
-      422,
-      "VALIDATION",
-      "Email and password of at least 8 characters required"
-    );
-  }
-
-  if (db.users.some((u) => u.email === email)) {
-    return fail(
-      r,
-      409,
-      "EXISTS",
-      "Email already registered"
-    );
-  }
-
-  const hashedPassword = await bcrypt.hash(password, 10);
-
-  if (db.users.some((u) => u.email === email)) {
-    return fail(r, 409, "EXISTS", "Email already registered");
-  }
-
-  db.users.push({
-    id: randomUUID(),
-    email,
-    password: hashedPassword,
-  });
-
-  await save();
-
-  return ok(r, {
-    registered: true,
-  });
-});
-
-// ==============================
-// LOGIN
-// ==============================
-
-api.post("/auth/login", async (q, r) => {
-  const { email, password } = q.body;
-
-  if (typeof password !== "string") {
-    return fail(r, 401, "INVALID", "Invalid credentials");
-  }
-
-  const u = db.users.find(
-    (u) => u.email === email
-  );
-
-  if (!u || !(await bcrypt.compare(password, u.password))) {
-    return fail(
-      r,
-      401,
-      "INVALID",
-      "Invalid credentials"
-    );
-  }
-
-  const token = jwt.sign(
-    {
-      id: u.id,
-      email: u.email,
-      role: "customer",
-    },
-    secret,
-    {
-      expiresIn: "1d",
-    }
-  );
-
-  return ok(r, { token });
-});
-
+function admin(q,r,n){if(q.user.role!=="admin")return fail(r,403,"FORBIDDEN","Admin only");n();}
+function customer(q,r,n){if(q.user.role!=="customer")return fail(r,403,"FORBIDDEN","Customer only");n();}
+api.post("/auth/register",async(q,r)=>{const {email,password}=q.body;if(typeof email!=="string"||!email.includes("@")||typeof password!=="string"||password.length<8)return fail(r,422,"VALIDATION","Valid email and password required");const {error}=await supabase.from("users").insert({id:randomUUID(),email:email.trim().toLowerCase(),name:email.split("@")[0],password_hash:await bcrypt.hash(password,10),role:"customer"});if(error)return fail(r,error.code==="23505"?409:503,"REGISTER_FAILED",error.code==="23505"?"Email already registered":"Registration failed");return ok(r,{registered:true});});
+api.post("/auth/login",async(q,r)=>{const {email,password}=q.body;if(typeof email!=="string"||typeof password!=="string")return fail(r,401,"INVALID","Invalid credentials");const {data:u,error}=await supabase.from("users").select("id,email,password_hash,role").eq("email",email.trim().toLowerCase()).maybeSingle();if(error)return fail(r,503,"DATABASE_ERROR","Login unavailable");if(!u||!await bcrypt.compare(password,u.password_hash))return fail(r,401,"INVALID","Invalid credentials");return ok(r,{token:jwt.sign({id:u.id,email:u.email,role:u.role},secret,{expiresIn:"1d"})});});
+api.get("/auth/me",auth,(q,r)=>ok(r,q.user));
+api.get("/admin/overview",auth,admin,async(q,r)=>{const {data,error}=await supabase.from("users").select("id,name,email,role,created_at").eq("role","customer");if(error)return fail(r,503,"DATABASE_ERROR","Customers unavailable");return ok(r,{products:db.products,customers:data,orders:db.orders.map(({id,status,total,createdAt,user})=>({id,status,total,createdAt,user}))});});
+api.put("/admin/products/:id",auth,admin,async(q,r)=>{const p=db.products.find(p=>p.id===Number(q.params.id));if(!p)return fail(r,404,"NOT_FOUND","Book not found");const {price,stock}=q.body;if(typeof price!=="number"||!Number.isFinite(price)||price<0||!Number.isInteger(stock)||stock<0)return fail(r,422,"VALIDATION","Invalid price or stock");Object.assign(p,{price,stock});await save();return ok(r,p);});
 // ==============================
 // GET ALL BOOKS AND SEARCH
 // ==============================
@@ -318,11 +222,11 @@ function cart(id) {
     .filter((x) => x.id);
 }
 
-api.get("/cart", auth, (q, r) => {
+api.get("/cart", auth, customer, (q, r) => {
   return ok(r, cart(q.user.id));
 });
 
-api.put("/cart", auth, async (q, r) => {
+api.put("/cart", auth, customer, async (q, r) => {
   const items = q.body.items;
 
   if (
@@ -493,7 +397,7 @@ api.post("/ai", async (q, r) => {
 // GET ORDER HISTORY
 // ==============================
 
-api.get("/orders", auth, (q, r) => {
+api.get("/orders", auth, customer, (q, r) => {
   const orders = db.orders.filter(
     (o) => o.user === q.user.id
   );
@@ -505,7 +409,7 @@ api.get("/orders", auth, (q, r) => {
 // GET SINGLE ORDER
 // ==============================
 
-api.get("/orders/:id", auth, (q, r) => {
+api.get("/orders/:id", auth, customer, (q, r) => {
   const o = db.orders.find(
     (o) =>
       o.id === q.params.id &&
@@ -528,7 +432,7 @@ api.get("/orders/:id", auth, (q, r) => {
 // MAYA SANDBOX CHECKOUT
 // ==============================
 
-api.post("/checkout", auth, async (q, r) => {
+api.post("/checkout", auth, customer, async (q, r) => {
   const key = q.get("Idempotency-Key");
 
   if (
@@ -694,7 +598,7 @@ api.post("/checkout", auth, async (q, r) => {
 // MAYA PAYMENT VERIFICATION
 // ==============================
 
-api.post("/orders/:id/verify", auth, async (q, r) => {
+api.post("/orders/:id/verify", auth, customer, async (q, r) => {
   const o = db.orders.find(
     (o) =>
       o.id === q.params.id &&
